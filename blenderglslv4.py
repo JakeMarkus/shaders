@@ -69,26 +69,12 @@ const vec4 _iChannelDummy = vec4(0.0);
 // -------------------------------------
 """
 
-# Wrap the Shadertoy mainImage convention into a real GLSL main() that
-# uses OBJECT-SPACE position instead of screen-space gl_FragCoord.
-# v_obj_pos is the interpolated local-space vertex position passed from
-# the vertex shader.  We scale it so that one Blender unit ≈ 100 "pixels",
-# which keeps most Shadertoy coordinate math in a reasonable range.
-# iResolution is repurposed to carry the same scale so that shaders that
-# divide by iResolution.xy to get [0,1] UVs still work naturally.
+# Wrap the Shadertoy mainImage convention into a real GLSL main()
 _SHADERTOY_MAIN_WRAPPER = """\
 
-// Interpolated object-space position from vertex shader
-in vec3 v_obj_pos;
-
 void main() {
-    // Map object-space XY to Shadertoy fragCoord.
-    // Scale factor: 1 Blender unit = 100 "pixels" — keeps coordinate
-    // magnitudes similar to a typical 800x450 Shadertoy canvas.
-    const float ST_SCALE = 100.0;
-    vec2 fragCoord = v_obj_pos.xy * ST_SCALE;
-
     vec4 fragColor = vec4(0.0);
+    vec2 fragCoord = gl_FragCoord.xy;
     mainImage(fragColor, fragCoord);
     FragColor = fragColor;
 }
@@ -98,19 +84,6 @@ void main() {
 # compiler doesn't want duplicated
 _VERSION_RE = re.compile(r"^\s*#version\s+\S+.*$", re.MULTILINE)
 _PRECISION_RE = re.compile(r"^\s*precision\s+\S+\s+\S+\s*;.*$", re.MULTILINE)
-
-# Vertex shader addition: emit object-space position as a varying so the
-# fragment wrapper can use it instead of gl_FragCoord.
-_SHADERTOY_VERTEX_VARYING = """\
-
-// Pass object-space position to the Shadertoy fragment wrapper
-out vec3 v_obj_pos;
-"""
-
-_SHADERTOY_VERTEX_EMIT = """\
-    // Emit object-space position for Shadertoy surface mapping
-    v_obj_pos = pos;
-"""
 
 
 def is_shadertoy_fragment(source: str) -> bool:
@@ -130,7 +103,7 @@ def adapt_shadertoy_fragment(source: str) -> str:
        to return vec4(0) via macro so the shader compiles even without
        actual textures.
     3. Prepend the compatibility uniform block.
-    4. Append a real main() that calls mainImage() with object-space coords.
+    4. Append a real main() that calls mainImage().
     """
     # Strip #version and precision directives
     source = _VERSION_RE.sub("", source)
@@ -173,31 +146,9 @@ def adapt_shadertoy_fragment(source: str) -> str:
 
 def adapt_shadertoy_vertex(vertex_source: str) -> str:
     """
-    Inject the `out vec3 v_obj_pos` varying declaration and the emit
-    statement into the vertex shader so the fragment wrapper can read
-    the object-space position.
-
-    We insert the `out` declaration just before `void main()` and inject
-    the emit line as the last statement before the closing brace of main().
+    Shadertoy shaders have no vertex stage. Return vertex_source unchanged;
+    the adapter only touches the fragment side.
     """
-    # Inject the `out` declaration before void main()
-    vertex_source = re.sub(
-        r"(void\s+main\s*\(\s*\))",
-        _SHADERTOY_VERTEX_VARYING + r"\1",
-        vertex_source,
-        count=1,
-    )
-
-    # Inject the emit statement before the last closing brace of main()
-    # Strategy: replace the final } in the file (which closes main())
-    last_brace = vertex_source.rfind("}")
-    if last_brace != -1:
-        vertex_source = (
-            vertex_source[:last_brace]
-            + _SHADERTOY_VERTEX_EMIT
-            + vertex_source[last_brace:]
-        )
-
     return vertex_source
 
 
@@ -465,11 +416,6 @@ def build_object_shader(vertex_source, fragment_source, is_shadertoy=False):
     Build a GPUShader from vertex + fragment source.
     If is_shadertoy is True, the fragment has already been preprocessed by
     adapt_shadertoy_fragment() and needs the Shadertoy push_constants added.
-
-    For Shadertoy shaders the vertex shader must also have been preprocessed
-    by adapt_shadertoy_vertex() so that it emits `out vec3 v_obj_pos`.
-    The interface block that connects them is declared here via
-    GPUShaderCreateInfo so the compiler sees a consistent interface.
     """
     info = gpu.types.GPUShaderCreateInfo()
     info.push_constant("MAT4", "ModelViewProjectionMatrix")
@@ -499,13 +445,6 @@ def build_object_shader(vertex_source, fragment_source, is_shadertoy=False):
 
     info.vertex_in(0, "VEC3", "pos")
     info.fragment_out(0, "VEC4", "FragColor")
-
-    # For Shadertoy shaders we pass the object-space position from the
-    # vertex stage to the fragment stage via an interface block.
-    if is_shadertoy:
-        iface = gpu.types.GPUStageInterfaceInfo("ShadertoyInterface")
-        iface.smooth("VEC3", "v_obj_pos")
-        info.vertex_out(iface)
 
     # Strip uniform declarations that are now push_constants
     all_stripped = custom_names
@@ -902,11 +841,11 @@ class SIMPLESHADER_OT_object_uniform_remove(bpy.types.Operator):
 # ------------------------------------------------------------
 
 class VIEW3D_PT_simple_shader(bpy.types.Panel):
-    bl_label      = "GLSL"
+    bl_label      = "Simple Shader"
     bl_idname     = "VIEW3D_PT_simple_shader"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category   = "GLSL"
+    bl_category   = "Shader"
 
     def draw(self, context):
         layout = self.layout
@@ -947,7 +886,7 @@ class VIEW3D_PT_simple_shader(bpy.types.Panel):
                 if cached and cached.get("shadertoy"):
                     st_row = box.row()
                     st_row.enabled = False
-                    st_row.label(text="Shadertoy mode: surface-mapped (object-space XY)", icon='SHADERFX')
+                    st_row.label(text="Shadertoy mode: iTime/iResolution/etc. active", icon='SHADERFX')
 
             box.label(text="⚠ Uniforms must match 'uniform T name;' in your GLSL.", icon='INFO')
 
@@ -1063,12 +1002,7 @@ def draw_callback_view():
     i_frame_int  = scene.frame_current
     i_date       = get_idate()
     vp_w, vp_h   = _get_viewport_resolution(context)
-    # For Shadertoy surface mapping, iResolution carries the object-space
-    # extent scaled by ST_SCALE (100.0) so shaders that normalise by
-    # iResolution.xy still produce sensible [0,1] UVs over a 1-unit object.
-    # The Z component keeps the usual value of 1.0.
-    ST_SCALE = 100.0
-    i_resolution = (ST_SCALE, ST_SCALE, 1.0)
+    i_resolution = (vp_w, vp_h, 1.0)
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
